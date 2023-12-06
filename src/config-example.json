@@ -1,0 +1,50 @@
+{
+  "comment": "这是一个示例配置文件, 请复制此文件并重命名为config.json, 然后修改为你自己的配置",
+  "wsgi": false,
+  "server": {
+    "port": 5000,
+    "host": "0.0.0.0",
+    "ipv6": false,
+    "debug": false,
+    "thread": false,
+    "https": {
+      "enable": false,
+      "ssl_cert": "",
+      "ssl_key": "",
+      "force_https": false
+    }
+  },
+  "database": {
+    "blacklist_path": "blacklist.sqlite",
+    "tasks_path": "tasks.sqlite"
+  },
+  "administrator": {
+    "enable": true,
+    "totp_key":  "XXXXXXXXXXXXXXXX"
+  },
+  "save_dir": "output",
+  "encoding": "utf-8",
+  "filename_format": "{title}_{book_id}",
+  "speed_limit": 0.5, "?speed_limit": "下载速度限制, 单位为s/it, 最低为0.25",
+  "time_range": "false", "?time_range": "可用时间, 用-分隔, 例如 18-22 表示晚上6点到10点（北京时间），不限制请填‘false’",
+  "upload": {
+    "base_dir": "",
+    "cos": {
+      "comment": "腾讯云对象存储, 请参考 https://cloud.tencent.com/document/product/436/8629",
+      "enable": false,
+      "secret_id": "",
+      "secret_key": "",
+      "region": "ap-xxxxxxxx",
+      "bucket": "xxx-0000000000"
+    },
+    "ofb":{
+      "comment": "OneDrive for Business",
+      "enable": false,
+      "client_id": "your_client_id",
+      "client_secret": "your_client_secret",
+      "tenant_id": "your_tenant_id",
+      "endpoint": "/Documents/"
+    }
+  }
+
+}
