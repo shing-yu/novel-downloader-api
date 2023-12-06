@@ -59,11 +59,11 @@ def cos_upload(file_path):
     object_name = cos_base_dir + cos_dir + "/" + file_name
 
     # 上传文件
-    response = client.upload_file(
+    response = client.put_object_from_local_file(
         Bucket=bucket,
         LocalFilePath=file_path,
         Key=object_name,
-        EnableMD5=True
+        EnableMD5=True,
     )
 
     return response["ETag"]
