@@ -2,9 +2,6 @@
 import os
 
 # 导入必要的模块
-import requests
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin
 import re
 from os import path
 import time
@@ -18,114 +15,45 @@ from qcloud_cos import CosClientError
 
 
 # 定义正常模式用来下载番茄小说的函数
-def fanqie_l(url, encoding, return_dict):
+def download(url: str, encoding: str, config: dict) -> tuple:
+    title = None
+    last_cid = None
+    finished: int = -1  # 使用数字代表小说是否已完结，-1 代表未知，0 代表未完结，1 代表已完结
 
     try:
+
+        # 提取书籍ID
+        book_id = re.search(r'page/(\d+)', url).group(1)
+
         ua = (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/118.0.0.0 "
             "Safari/537.36"
         )
-        headers = {
-            "User-Agent": ua
-        }
-
-        # 提取书籍ID
-        book_id = re.search(r'page/(\d+)', url).group(1)
-
-        # 获取网页源码
-        response = requests.get(url, headers=headers, timeout=10)
-        html = response.text
-
-        # 解析网页源码
-        soup = BeautifulSoup(html, "html.parser")
-
-        # 获取小说标题
-        title = soup.find("h1").get_text()
-        # , class_ = "info-name"
-        # 替换非法字符
-        title = p.rename(title)
-
-        # 获取小说信息
-        info = soup.find("div", class_="page-header-info").get_text()
-
-        # 获取小说简介
-        intro = soup.find("div", class_="page-abstract-content").get_text()
-
-        # 拼接小说内容字符串
-        content = f"""使用 @星隅(xing-yv) 所作开源工具下载
-开源仓库地址:https://github.com/xing-yv/fanqie-novel-download
-Gitee:https://gitee.com/xingyv1024/fanqie-novel-download/
-任何人无权限制您访问本工具，如果有向您提供代下载服务者未事先告知您工具的获取方式，请向作者举报:xing_yv@outlook.com
-
-{title}
-{info}
-{intro}
-    """
-
-        # 获取所有章节链接
-        chapters = soup.find_all("div", class_="chapter-item")
+        headers, title, content, chapters, finished = p.get_fanqie(url, ua)
 
         # 定义文件名
-        file_path = path.join('output', f'{title}_{book_id}.txt')
+        file_path = path.join(config["save_dir"],
+                              config["filename_format"].format(title=title, book_id=book_id))
 
-        os.makedirs("output", exist_ok=True)
+        os.makedirs(config["save_dir"], exist_ok=True)
+
+        last_cid = None
 
         try:
             # 遍历每个章节链接
             for chapter in chapters:
-                time.sleep(0.5)
-                # 获取章节标题
-                chapter_title = chapter.find("a").get_text()
+                time.sleep(config["speed_limit"] if config["speed_limit"] > 0.25 else 0.25)
 
-                # 获取章节网址
-                chapter_url = urljoin(url, chapter.find("a")["href"])
+                result = p.get_api(chapter, headers)
 
-                # 获取章节 id
-                chapter_id = re.search(r"/(\d+)", chapter_url).group(1)
+                if result is None:
+                    continue
+                else:
+                    chapter_title, chapter_text, chapter_id = result
 
-                # 构造 api 网址
-                api_url = (f"https://novel.snssdk.com/api/novel/book/reader/full/v1/?device_platform=android&"
-                           f"parent_enterfrom=novel_channel_search.tab.&aid=2329&platform_id=1&group_id="
-                           f"{chapter_id}&item_id={chapter_id}")
-                # 尝试获取章节内容
-                chapter_content = None
-                retry_count = 1
-                while retry_count < 4:  # 设置最大重试次数
-                    try:
-                        # 获取 api 响应
-                        api_response = requests.get(api_url, headers=headers, timeout=5)
-
-                        # 解析 api 响应为 json 数据
-                        api_data = api_response.json()
-                    except Exception as e:
-                        if retry_count == 1:
-                            print(f"错误：{e}")
-                            print(f"{chapter_title} 获取失败，正在尝试重试...")
-                        print(f"第 ({retry_count}/3) 次重试获取章节内容")
-                        retry_count += 1  # 否则重试
-                        continue
-
-                    if "data" in api_data and "content" in api_data["data"]:
-                        chapter_content = api_data["data"]["content"]
-                        break  # 如果成功获取章节内容，跳出重试循环
-                    else:
-                        retry_count += 1  # 否则重试
-
-                if retry_count == 4:
-                    continue  # 重试次数过多后，跳过当前章节
-
-                # 提取文章标签中的文本
-                chapter_text = re.search(r"<article>([\s\S]*?)</article>", chapter_content).group(1)
-
-                # 将 <p> 标签替换为换行符
-                chapter_text = re.sub(r"<p>", "\n", chapter_text)
-
-                # 去除其他 html 标签
-                chapter_text = re.sub(r"</?\w+>", "", chapter_text)
-
-                chapter_text = p.fix_publisher(chapter_text)
+                last_cid = chapter_id
 
                 # 在小说内容字符串中添加章节标题和内容
                 content += f"\n\n\n{chapter_title}\n{chapter_text}"
@@ -137,13 +65,15 @@ Gitee:https://gitee.com/xingyv1024/fanqie-novel-download/
             with open(file_path, "wb") as f:
                 f.write(data)
 
-            return_dict[f'result1'] = f"小说《{title}》已保存到本地"
+            print(f"小说《{title}》已保存到本地")
 
-            cos_status = upload_cos(file_path, title)
+            cos_status = upload_cos(file_path, title, config)
 
-            return_dict[f'result2'] = cos_status
+            print(cos_status)
 
-            pass
+            status = "completed"
+
+            return status, title, last_cid, finished
 
         except BaseException as e:
             # 捕获所有异常，及时保存文件
@@ -154,23 +84,23 @@ Gitee:https://gitee.com/xingyv1024/fanqie-novel-download/
             with open(file_path, "wb") as f:
                 f.write(data)
 
-            return_dict[f'result3'] = f"小说《{title}》下载失败：{e}"
+            print(f"小说《{title}》下载失败：{e}")
 
-            return_dict[f'result4'] = f"小说《{title}》已保存到本地（中断保存）"
+            print(f"小说《{title}》已保存到本地（中断保存）")
 
             raise Exception(f"下载失败: {e}")
-            pass
 
     except BaseException as e:
-        return_dict['error'] = str(e)
+        print(f"小说《{title}》下载失败：{e}")
+        return "failed", title, last_cid, finished
 
 
-def upload_cos(file_path, title):
+def upload_cos(file_path, title, config):
 
-    # 通过环境变量判断是否上传到COS
-    if os.getenv("IS_COS") == "True":
+    # 通过配置文件判断是否上传到COS
+    if config["upload"]["cos"]["enable"]:
         try:
-            cos_upload(file_path)
+            cos_upload(file_path, config)
             result = f"小说《{title}》，路径：{file_path}，已上传到COS"
         except AssertionError as e:
             result = f"上传小说《{title}》，路径：{file_path}，失败：{e}"
@@ -188,3 +118,81 @@ def upload_cos(file_path, title):
         result = "未启用COS上传"
 
     return result
+
+
+def update(url: str, encoding: str, start_id: str, file_path: str, config: dict) -> tuple:
+    title = None
+    chapter_id_now = start_id
+    finished: int = 0
+
+    if os.path.exists(file_path) is False:
+        return "failed", chapter_id_now, finished
+
+    try:
+
+        ua = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/118.0.0.0 "
+            "Safari/537.36"
+        )
+        headers, title, content, chapters, finished = p.get_fanqie(url, ua)
+
+        last_cid = None
+        # 找到起始章节的索引
+        start_index = 0
+        for i, chapter in enumerate(chapters):
+            chapter_url_tmp = chapter.find("a")["href"]
+            chapter_id_tmp = re.search(r"/reader/(\d+)", chapter_url_tmp).group(1)
+            if chapter_id_tmp == start_id:  # 更新函数，所以前进一个章节
+                start_index = i + 1
+            last_cid = chapter_id_tmp
+
+        # 判断是否已经最新
+        if start_index >= len(chapters):
+            return "completed", title, last_cid, finished
+
+        with open(file_path, 'ab') as f:
+            try:
+                # 从起始章节开始遍历每个章节链接
+                for chapter in chapters[start_index:]:
+
+                    time.sleep(config["speed_limit"] if config["speed_limit"] > 0.25 else 0.25)
+
+                    result = p.get_api(chapter, headers)
+
+                    if result is None:
+                        continue
+                    else:
+                        chapter_title, chapter_text, chapter_id_now = result
+
+                    # 在小说内容字符串中添加章节标题和内容
+                    content = f"\n\n\n{chapter_title}\n{chapter_text}"
+
+                    # 根据编码转换小说内容字符串为二进制数据
+                    data = content.encode(encoding, errors='ignore')
+
+                    # 将数据追加到文件中
+                    f.write(data)
+
+                print(f"小说《{title}》已保存到本地，路径：{file_path}")
+
+                cos_status = upload_cos(file_path, title, config)
+
+                print(cos_status)
+
+                status = "completed"
+
+                return status, chapter_id_now, finished
+
+            except BaseException as e:
+
+                print(f"小说《{title}》更新失败：{e}")
+
+                print(f"小说《{title}》已保存到本地（中断保存）")
+
+                raise Exception(f"更新失败: {e}")
+
+    except BaseException as e:
+        print(f"小说《{title}》更新失败：{e}")
+        return "failed", chapter_id_now, finished

@@ -26,15 +26,18 @@ import json
 import multiprocessing
 import queue
 import threading
-from multiprocessing import Process, Manager
+from multiprocessing import Pool
 import time
-import fanqie_api as fa
+# import fanqie_api as fa
+from fanqie_api import download, update
 from flask import Flask, request, jsonify, make_response, send_from_directory
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from datetime import datetime, timedelta
+# 使用sqlite数据库替换黑名单和任务状态表
+import sqlite3
 
-with open("config.json", "r") as conf:
+with open("config.json", "r", encoding='utf-8') as conf:
     try:
         config = json.load(conf)
     except json.JSONDecodeError as conf_e:
@@ -42,7 +45,6 @@ with open("config.json", "r") as conf:
 
 os.makedirs(config["save_dir"], exist_ok=True)
 
-ipv6 = config["server"]["ipv6"]["enable"]
 https = config["server"]["https"]["enable"]
 cert_path = config["server"]["https"]["ssl_cert"]
 key_path = config["server"]["https"]["ssl_key"]
@@ -52,20 +54,45 @@ try:
 except ValueError:
     pass
 
+if config["administrator"]["totp"]["enable"]:
+    from pyotp import TOTP
+
+    try:
+        totp = TOTP(config["administrator"]["totp"]["secret"])
+    except TypeError:
+        raise TypeError("管理员TOTP密钥格式不正确")
+
+
 app = Flask(__name__)
-if config["reserve_proxy"]:
-    pass
-else:
+if config["reserve_proxy"] is False:
     from flask_cors import CORS
     CORS(app)
 limiter = Limiter(
     key_func=get_remote_address,
     app=app,
-    default_limits=["200 per day", "50 per hour"]
+    default_limits=["360 per day", "180 per hour"]
 )
 
-# 存储被限制的IP和他们的限制解除时间
-blacklist = {}
+# 创建并连接数据库
+db = sqlite3.connect(config["database"], check_same_thread=False)
+
+# 创建一个黑名单表
+db.execute('''
+CREATE TABLE IF NOT EXISTS blacklist
+(ip TEXT PRIMARY KEY,
+unblock_time TEXT);
+''')
+
+# 创建一个任务状态表
+db.execute('''
+CREATE TABLE IF NOT EXISTS novels
+(id TEXT PRIMARY KEY,
+name TEXT,
+status TEXT,
+last_cid TEXT,
+last_update TEXT,
+finished INTEGER);
+''')
 
 
 @app.before_request
@@ -73,34 +100,43 @@ def block_method():
     if request.method == 'POST':
         ip = get_remote_address()
         # 检查IP是否在黑名单中
-        if ip in blacklist:
+        cur = db.cursor()
+        cur.execute("SELECT unblock_time FROM blacklist WHERE ip=?", (ip,))
+        row = cur.fetchone()
+        if row is not None:
             # 检查限制是否已经解除
-            if datetime.now() < blacklist[ip]:
+            unblock_time = datetime.strptime(row[0], '%Y-%m-%d %H:%M:%S.%f')
+            if datetime.now() < unblock_time:
                 response = make_response("Too many requests. You have been added to the blacklist for 1 hour.", 429)
                 # 计算剩余的封禁时间（以秒为单位），并添加到'Retry-After'头部
-                retry_after = int((blacklist[ip] - datetime.now()).total_seconds())
+                retry_after = int((unblock_time - datetime.now()).total_seconds())
                 response.headers['Retry-After'] = str(retry_after)
                 return response
             else:
                 # 如果限制已经解除，那么从黑名单中移除这个IP
-                del blacklist[ip]
-        if config["server"]["https"]["force_https"] is True and config["reserve_proxy"] is False:
-            # noinspection PyPackageRequirements
-            from flask import redirect
-            if not request.is_secure:
-                # noinspection HttpUrlsUsage
-                url = request.url.replace('http://', 'https://', 1)
-                code = 301
-                return redirect(url, code=code)
+                cur.execute("DELETE FROM blacklist WHERE ip=?", (ip,))
+                db.commit()
 
 
 @app.errorhandler(429)
 def ratelimit_handler(_e):
     # 将触发限制的IP添加到黑名单中，限制解除时间为1小时后
-    blacklist[get_remote_address()] = datetime.now() + timedelta(hours=1)
+    ip = get_remote_address()
+    unblock_time = datetime.now() + timedelta(hours=1)
+    cur = db.cursor()
+    cur.execute("INSERT OR REPLACE INTO blacklist VALUES (?, ?)", (ip, unblock_time.strftime('%Y-%m-%d %H:%M:%S.%f')))
+    db.commit()
     response = make_response("Too many requests. You have been added to the blacklist for 1 hour.", 429)
     response.headers['Retry-After'] = str(3600)  # 1小时的秒数
     return response
+
+
+def book_id_to_url(book_id):
+    return 'https://fanqienovel.com/page/' + book_id
+
+
+def url_to_book_id(url):
+    return re.search(r"page/(\d+)", url).group(1)
 
 
 # 定义爬虫类
@@ -110,34 +146,52 @@ class Spider:
         self.url_queue = queue.Queue()
         # 设置运行状态为True
         self.is_running = True
-        # 初始化任务状态字典
-        self.task_status = {}
 
     @staticmethod
     def crawl(url):
         try:
             print(f"Crawling for URL: {url}")
-            with Manager() as manager:
-                return_dict = manager.dict()
-                # 创建一个新的进程来运行爬虫函数
-                p = Process(target=fa.fanqie_l, args=(url, 'utf-8', return_dict))
-                p.start()
-                p.join()  # 等待进程结束
-                if 'error' in return_dict:
-                    for i in range(1, 5):
-                        try:
-                            print(f"{return_dict[f'result{i}']}")
-                        except KeyError:
-                            continue
-                    print(f"Error: {return_dict['error']}")
-                    return False
-                else:
-                    for i in range(1, 5):
-                        try:
-                            print(f"{return_dict[f'result{i}']}")
-                        except KeyError:
-                            continue
-                    return True
+            book_id = url_to_book_id(url)
+            cur = db.cursor()
+            cur.execute("SELECT finished FROM novels WHERE id=?", (book_id,))
+            row = cur.fetchone()
+            # 根据完结信息判断模式
+            if row is not None and row[0] == 0:
+                # 如果已有信息，使用增量更新模式
+                with Pool(processes=1) as pool:
+                    cur.execute("SELECT name, last_cid FROM novels WHERE id=?", (book_id,))
+                    row = cur.fetchone()
+                    title = row[0]
+                    last_cid = row[1]
+                    file_path = os.path.join(config["save_dir"],
+                                             config["filename_format"].format(title=title, book_id=book_id))
+                    res = pool.apply(update, (url, config["encoding"], last_cid, file_path, config))  # 运行函数
+                    # 获取任务和小说信息
+                    status, last_cid, finished = res
+                    # 写入数据库
+                    cur.execute("UPDATE novels SET last_cid=?, last_update=?, finished=? WHERE id=?",
+                                (last_cid, datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f'), finished,
+                                 book_id))
+                    db.commit()
+                    if status == "completed":
+                        return "completed"
+                    else:
+                        return "failed"
+            else:
+                # 如果没有或者未成功，则普通下载
+                with Pool(processes=1) as pool:
+                    res = pool.apply(download, (url, config["encoding"], config))  # 运行函数
+                    # 获取任务和小说信息
+                    status, name, last_cid, finished = res
+                    # 写入数据库
+                    cur.execute("UPDATE novels SET name=?, last_cid=?, last_update=?, finished=? WHERE id=?",
+                                (name, last_cid, datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f'), finished,
+                                 book_id))
+                    db.commit()
+                    if status == "completed":
+                        return True
+                    else:
+                        return False
         except Exception as e:
             print(f"Error: {e}")
             return False
@@ -148,12 +202,24 @@ class Spider:
             try:
                 # 从URL队列中获取URL
                 url = self.url_queue.get(timeout=1)
-                self.task_status[url] = "进行中"
+                book_id = url_to_book_id(url)
+                cur = db.cursor()
+                cur.execute("INSERT OR REPLACE INTO novels (id, status) VALUES (?, ?)", (book_id, "进行中"))
+                db.commit()
+                status = Spider.crawl(url)
                 # 调用爬虫函数爬取URL，如果出错则标记为失败并跳过这个任务进行下一个
-                if Spider.crawl(url):
-                    self.task_status[url] = "已完成"
+                if status:
+                    cur.execute("UPDATE novels SET status=? WHERE id=?", ("已完成", book_id))
+                    db.commit()
+                elif status == "completed":
+                    cur.execute("UPDATE novels SET status=? WHERE id=?", ("已更新完成", book_id))
+                    db.commit()
+                elif status == "failed":
+                    cur.execute("UPDATE novels SET status=? WHERE id=?", ("更新失败", book_id))
+                    db.commit()
                 else:
-                    self.task_status[url] = "失败"
+                    cur.execute("UPDATE novels SET status=? WHERE id=?", ("失败", book_id))
+                    db.commit()
                 # 完成任务后，标记任务为完成状态
                 self.url_queue.task_done()
             except queue.Empty:
@@ -164,18 +230,38 @@ class Spider:
         # 启动工作线程
         threading.Thread(target=self.worker, daemon=True).start()
 
-    def add_url(self, url):
-        # 检查URL格式是否正确，如果不正确则返回错误信息，否则将URL添加到队列中并返回成功信息
-        if "/page/" not in url:
-            print(f"{url} URL格式不正确，内部错误")
-            return "URL格式不正确，内部错误", 500
+    def add_url(self, book_id):
+        # 则将URL添加到队列中并返回成功信息
+        cur = db.cursor()
+        cur.execute("SELECT status, finished FROM novels WHERE id=?", (book_id,))
+        row = cur.fetchone()
+        if row is None or row[0] == "失败":
+            self.url_queue.put(book_id_to_url(book_id))
+            cur.execute("INSERT OR REPLACE INTO novels (id, status) VALUES (?, ?)", (book_id, "等待中"))
+            db.commit()
+            return "此书籍已添加到下载队列"
         else:
-            if url not in self.task_status or self.task_status[url] == "失败":
-                self.url_queue.put(url)
-                self.task_status[url] = "等待中"
-                return "此书籍已添加到下载队列"
+            # 如果已存在，检查书籍是否已完结
+            if row[1] == 1:
+                # 如果已完结，返回提示信息
+                return "此书籍已存在且已完结，请直接前往下载"
+            elif row[0] == "等待中" or row[0] == "进行中" or row[0] == "等待更新中":
+                # 如果正在下载，返回提示信息
+                return "此书籍已存在且正在下载（如果你需要查询，请在“类型”中选择“查询”而不是“添加”）"
             else:
-                return "此书籍已存在"
+                cur.execute("SELECT last_update FROM novels WHERE id=?", (book_id,))
+                row = cur.fetchone()
+                last_update = datetime.strptime(row[0], '%Y-%m-%d %H:%M:%S.%f')
+
+                # 如果上次时间距现在小于3小时，返回提示
+                if datetime.now() - last_update < timedelta(hours=3):
+                    return "此书籍已存在且上次更新距现在不足3小时，请稍后再试"
+
+                # 如果未完结，返回提示信息并尝试更新
+                self.url_queue.put(book_id_to_url(book_id))
+                cur.execute("UPDATE novels SET status=? WHERE id=?", ("等待更新中", book_id))
+                db.commit()
+                return "此书籍已存在，正在尝试更新"
 
     def stop(self):
         # 设置运行状态为False以停止工作线程
@@ -188,7 +274,9 @@ spider.start()
 
 
 @app.route('/api', methods=['POST'])
-@limiter.limit("15/minute;200/hour;300/day")  # 限制请求
+@limiter.limit(f"{config['limiter']['api']['per_minute']}/minute;"
+               f"{config['limiter']['api']['per_hour']}/hour;"
+               f"{config['limiter']['api']['per_day']}/day")  # 限制请求
 def api():
 
     # 判断是否在限时范围内
@@ -223,17 +311,37 @@ def api():
 
     # 如果'action'字段的值为'add'，则尝试将URL添加到队列中，并返回相应的信息和位置
     if data['action'] == 'add':
-        url = 'https://fanqienovel.com/page/' + data['id']
-        message = spider.add_url(url)
+        book_id = data['id']
+        message = spider.add_url(book_id)
+        url = book_id_to_url(book_id)
         position = list(spider.url_queue.queue).index(url) + 1 if url in list(spider.url_queue.queue) else None
-        status = spider.task_status.get(url, None)
+        cur = db.cursor()
+        cur.execute("SELECT status, last_update FROM novels WHERE id=?", (book_id,))
+        row = cur.fetchone()
+        status = row[0] if row is not None else None
+        if row is not None:
+            last_update = row[1].split('.')[0] if row[1] is not None else None
+        else:
+            last_update = None
+        if last_update is not None:
+            status = status + " " + last_update.split(".")[0]
         return jsonify({'message': message, 'position': position, 'status': status})
 
     # 如果'action'字段的值为'query'，则检查URL是否在队列中，并返回相应的信息和位置或不存在的信息
     elif data['action'] == 'query':
-        url = 'https://fanqienovel.com/page/' + data['id']
+        book_id = data['id']
+        url = book_id_to_url(book_id)
         position = list(spider.url_queue.queue).index(url) + 1 if url in list(spider.url_queue.queue) else None
-        status = spider.task_status.get(url, None)
+        cur = db.cursor()
+        cur.execute("SELECT status, last_update FROM novels WHERE id=?", (book_id,))
+        row = cur.fetchone()
+        status = row[0] if row is not None else None
+        if row is not None:
+            last_update = row[1].split('.')[0] if row[1] is not None else None
+        else:
+            last_update = None
+        if last_update is not None:
+            status = status + " " + last_update
         return jsonify({'exists': status is not None, 'position': position, 'status': status})
 
     else:
@@ -241,9 +349,11 @@ def api():
 
 
 @app.route('/list')
-@limiter.limit("20/minute;200/hour;500/day")
+@limiter.limit(f"{config['limiter']['list']['per_minute']}/minute;"
+               f"{config['limiter']['list']['per_hour']}/hour;"
+               f"{config['limiter']['list']['per_day']}/day")  # 限制请求
 def file_list():
-    folder_path = 'output'  # 替换为你的文件夹路径
+    folder_path = config["save_dir"]
     files = os.listdir(folder_path)
     # 按最后修改时间排序
     files.sort(key=lambda x: os.path.getmtime(os.path.join(folder_path, x)), reverse=True)
@@ -252,10 +362,137 @@ def file_list():
 
 
 @app.route('/download/<path:filename>')
-@limiter.limit("10/minute;100/hour;300/day")
+@limiter.limit(f"{config['limiter']['download']['per_minute']}/minute;"
+               f"{config['limiter']['download']['per_hour']}/hour;"
+               f"{config['limiter']['download']['per_day']}/day")  # 限制请求
 def download_file(filename):
-    directory = os.path.abspath('output')
-    return send_from_directory(directory, filename, as_attachment=True)  # 替换为你的文件夹路径
+    directory = os.path.abspath(config["save_dir"])
+    try:
+        return send_from_directory(directory, filename, as_attachment=True)
+    except FileNotFoundError:
+        return "File not found.", 404
+
+
+@app.route('/manage/<group>/<action>')
+def manage(group, action):
+    global config
+    if config["administrator"]["enable"] is False:
+        return "此功能已被禁用", 403
+    if group == "check":
+        if action == "check-passwd":
+            try:
+                passwd = request.args["passwd"]
+            except KeyError:
+                return "请求未携带密码，无权限访问", 403
+            if passwd != config["administrator"]["password"]:
+                return "密码错误，无权限访问", 403
+            return "密码正确"
+        elif action == "check-alive":
+            return "alive"
+        else:
+            return "Bad Request.", 400
+    try:
+        passwd = request.args["passwd"]
+    except KeyError:
+        return "请求未携带密码，无权限访问", 403
+    if passwd != config["administrator"]["password"]:
+        return "密码错误，无权限访问", 403
+    if config["administrator"]["totp"]["enable"]:
+        try:
+            totp_code = request.args["totp"]
+        except KeyError:
+            return "请求未携带TOTP验证码，无权限访问", 403
+        if not totp.verify(totp_code):
+            return "TOTP验证码错误，无权限访问", 403
+
+    if group == "main":
+        if action == "pause":
+            spider.stop()
+            return "已暂停"
+        elif action == "start":
+            spider.start()
+            return "已启动"
+        elif action == "status":
+            return jsonify({'status': spider.is_running})
+        elif action == "update-config":
+            with open("config.json", "r", encoding='utf-8') as conf_u:
+                try:
+                    config = json.load(conf_u)
+                except json.JSONDecodeError as conf_ue:
+                    raise json.JSONDecodeError("配置文件格式不正确", conf_ue.doc, conf_ue.pos)
+            return "已重新加载配置文件，部分配置需要重启服务器才能生效"
+        else:
+            return "Bad Request.", 400
+
+    elif group == "tasks":
+        if action == "list-new-tasks":
+            tasks_dict = {}
+            cur = db.cursor()
+            cur.execute("SELECT id, status FROM novels ORDER BY ROWID DESC LIMIT 30", ())
+            for i, row in enumerate(cur.fetchall()):
+                tasks_dict[f'task{i}'] = {'id': row[0], 'status': row[1]}
+            return jsonify(tasks_dict)
+        elif action == "list-all-tasks":
+            if config["administrator"]["enable-list-all-tasks"] is False:
+                return "此功能已被禁用", 403
+            tasks_dict = {}
+            cur = db.cursor()
+            cur.execute("SELECT id, status FROM novels")
+            for i, row in enumerate(cur.fetchall()):
+                tasks_dict[f'task{i}'] = {'id': row[0], 'status': row[1]}
+            return jsonify(tasks_dict)
+        elif action == "list-tasks-all":
+            # 已废弃的动作
+            return "请直接使用数据库管理工具查看", 410
+        elif action == "clear-tasks":
+            while not spider.url_queue.empty():
+                try:
+                    spider.url_queue.get_nowait()
+                except queue.Empty:
+                    break
+            return "已清空"
+        else:
+            return "Bad Request.", 400
+
+    elif group == "blacklist":
+        if action == "list-blacklist":
+            cur = db.cursor()
+            cur.execute("SELECT * FROM blacklist")
+            rows = cur.fetchall()
+            return jsonify(rows)
+        elif action == "add-blacklist":
+            ip = request.args["ip"]
+            cur = db.cursor()
+            if "time" not in request.args:
+                unblock_time = datetime.now() + timedelta(hours=1)
+                cur.execute("INSERT OR REPLACE INTO blacklist VALUES (?, ?)",
+                            (ip, unblock_time.strftime('%Y-%m-%d %H:%M:%S.%f')))
+                db.commit()
+                return "已添加，解除时间为1小时后"
+            else:
+                try:
+                    unblock_time = datetime.now() + timedelta(hours=int(request.args["time"]))
+                    cur.execute("INSERT OR REPLACE INTO blacklist VALUES (?, ?)",
+                                (ip, unblock_time.strftime('%Y-%m-%d %H:%M:%S.%f')))
+                    db.commit()
+                    return f"已添加，解除时间为{request.args['time']}小时后"
+                except ValueError:
+                    return "时间格式不正确"
+        elif action == "remove-blacklist":
+            ip = request.args["ip"]
+            cur = db.cursor()
+            cur.execute("DELETE FROM blacklist WHERE ip=?", (ip,))
+            db.commit()
+            return f"已移除 {ip}"
+        elif action == "clear-blacklist":
+            cur = db.cursor()
+            # noinspection SqlWithoutWhere
+            cur.execute("DELETE FROM blacklist")
+            db.commit()
+            return "已清空黑名单"
+
+    else:
+        return "Bad Request.", 400
 
 
 if __name__ == "__main__":
@@ -268,12 +505,14 @@ if __name__ == "__main__":
         app.run(host=config["server"]["host"],
                 port=config["server"]["port"],
                 threaded=config["server"]["thread"],
+                debug=config["server"]["debug"],
                 ssl_context=(cert_path, key_path)
                 )
     else:
-        print("HTTPS is enabled.")
+        print("HTTPS is disabled.")
         # 如果没有启用HTTPS
         app.run(host=config["server"]["host"],
                 port=config["server"]["port"],
-                threaded=config["server"]["thread"]
+                threaded=config["server"]["thread"],
+                debug=config["server"]["debug"]
                 )
