@@ -21,6 +21,6 @@ build/
 .mypy_cache/
 
 # 忽略个人文件和测试文件
-src/config.json
-src/test.py
+src/fanqie/config.json
+src/fanqie/test.py
 api.db

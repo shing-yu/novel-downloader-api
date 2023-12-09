@@ -30,7 +30,7 @@ import threading
 from multiprocessing import Pool
 import time
 # import fanqie_api as fa
-from fanqie_api import download, update
+from src.fanqie.fanqie_api import download, update
 from flask import Flask, request, jsonify, make_response, send_from_directory
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
