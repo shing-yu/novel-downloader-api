@@ -3,9 +3,10 @@
   "wsgi": false,
   "reserve_proxy": false, "?reserve_proxy": "如果你使用了反向代理，请将该项改为‘true’，否则程序将出现错误",
   "log": {
-    "level": "info",
-    "filename": "api.log",
-    "maxBytes": 20971520,
+    "level": "DEBUG",
+    "console_level": "INFO",
+    "filepath": "logs/api.log",
+    "maxSize": "20 MB",
     "backupCount": 20
   },
   "server": {

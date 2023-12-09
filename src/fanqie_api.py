@@ -6,6 +6,7 @@ import re
 from os import path
 import time
 import public as p
+from loguru import logger
 
 from cos_upload import cos_upload
 # noinspection PyPackageRequirements
@@ -20,6 +21,7 @@ def download(url: str, encoding: str, config: dict) -> tuple:
     last_cid = None
     finished: int = -1  # 使用数字代表小说是否已完结，-1 代表未知，0 代表未完结，1 代表已完结
 
+    # noinspection PyBroadException
     try:
 
         # 提取书籍ID
@@ -58,6 +60,8 @@ def download(url: str, encoding: str, config: dict) -> tuple:
                 # 在小说内容字符串中添加章节标题和内容
                 content += f"\n\n\n{chapter_title}\n{chapter_text}"
 
+                logger.trace(f"ID: {book_id} 已获取 {chapter_title} 章节ID: {chapter_id}")
+
             # 根据编码转换小说内容字符串为二进制数据
             data = content.encode(encoding, errors='ignore')
 
@@ -65,11 +69,9 @@ def download(url: str, encoding: str, config: dict) -> tuple:
             with open(file_path, "wb") as f:
                 f.write(data)
 
-            print(f"小说《{title}》已保存到本地")
+            logger.success(f"小说《{title}》已保存到本地")
 
-            cos_status = upload_cos(file_path, title, config)
-
-            print(cos_status)
+            upload_cos(file_path, title, config)
 
             status = "completed"
 
@@ -84,14 +86,15 @@ def download(url: str, encoding: str, config: dict) -> tuple:
             with open(file_path, "wb") as f:
                 f.write(data)
 
-            print(f"小说《{title}》下载失败：{e}")
+            logger.error(f"小说《{title}》下载失败：{e}")
 
-            print(f"小说《{title}》已保存到本地（中断保存）")
+            logger.exception(e)
+
+            logger.warning(f"小说《{title}》已保存到本地（中断保存）")
 
             raise Exception(f"下载失败: {e}")
 
-    except BaseException as e:
-        print(f"小说《{title}》下载失败：{e}")
+    except BaseException:
         return "failed", title, last_cid, finished
 
 
@@ -101,34 +104,32 @@ def upload_cos(file_path, title, config):
     if config["upload"]["cos"]["enable"]:
         try:
             cos_upload(file_path, config)
-            result = f"小说《{title}》，路径：{file_path}，已上传到COS"
+            logger.success(f"小说《{title}》，路径：{file_path}，已上传到COS")
         except AssertionError as e:
-            result = f"上传小说《{title}》，路径：{file_path}，失败：{e}"
+            logger.error(f"上传小说《{title}》，路径：{file_path}，失败：{e}")
         except KeyError as e:
-            result = f"上传小说《{title}》，路径：{file_path}，配置文件格式错误，失败：{e}"
+            logger.error(f"上传小说《{title}》，路径：{file_path}，配置文件格式错误，失败：{e}")
         except FileNotFoundError as e:
-            result = f"上传小说《{title}》，路径：{file_path}，文件未找到，失败：{e}"
+            logger.error(f"上传小说《{title}》，路径：{file_path}，文件未找到，失败：{e}")
         except CosServiceError as e:
-            result = f"上传小说《{title}》，路径：{file_path}，COS服务错误，失败：{e}"
+            logger.error(f"上传小说《{title}》，路径：{file_path}，COS服务错误，失败：{e}")
         except CosClientError as e:
-            result = f"上传小说《{title}》，路径：{file_path}，COS客户端错误，失败：{e}"
+            logger.error(f"上传小说《{title}》，路径：{file_path}，COS客户端错误，失败：{e}")
         except Exception as e:
-            result = f"上传小说《{title}》，路径：{file_path}，其它错误，失败：{e}"
+            logger.error(f"上传小说《{title}》，路径：{file_path}，其它错误，失败：{e}")
     else:
-        result = "未启用COS上传"
-
-    return result
+        logger.info(f"小说《{title}》，路径：{file_path}，未上传到COS: 未启用上传功能")
 
 
 def update(url: str, encoding: str, start_id: str, file_path: str, config: dict) -> tuple:
-    title = None
     chapter_id_now = start_id
     finished: int = 0
 
     if os.path.exists(file_path) is False:
-        print(f"小说更新失败：本地文件不存在 路径：{file_path}")
+        logger.error(f"小说更新失败：本地文件不存在 路径：{file_path}")
         return "failed", chapter_id_now, finished
 
+    # noinspection PyBroadException
     try:
 
         ua = (
@@ -151,7 +152,7 @@ def update(url: str, encoding: str, start_id: str, file_path: str, config: dict)
 
         # 判断是否已经最新
         if start_index >= len(chapters):
-            print(f"小说《{title}》已经是最新章节，无需更新")
+            logger.info(f"小说《{title}》已经是最新章节，无需更新")
             return "completed", last_cid, finished
 
         with open(file_path, 'ab') as f:
@@ -177,11 +178,11 @@ def update(url: str, encoding: str, start_id: str, file_path: str, config: dict)
                     # 将数据追加到文件中
                     f.write(data)
 
-                print(f"小说《{title}》已保存到本地，路径：{file_path}")
+                    logger.debug(f"小说: {title} 已增加 {chapter_title} 章节ID: {chapter_id_now}")
 
-                cos_status = upload_cos(file_path, title, config)
+                logger.success(f"小说《{title}》已保存到本地，路径：{file_path}")
 
-                print(cos_status)
+                upload_cos(file_path, title, config)
 
                 status = "completed"
 
@@ -189,12 +190,13 @@ def update(url: str, encoding: str, start_id: str, file_path: str, config: dict)
 
             except BaseException as e:
 
-                print(f"小说《{title}》更新失败：{e}")
+                logger.error(f"小说《{title}》更新失败：{e}")
 
-                print(f"小说《{title}》已保存到本地（中断保存）")
+                logger.exception(e)
+
+                logger.warning(f"小说《{title}》已保存到本地（中断保存）")
 
                 raise Exception(f"更新失败: {e}")
 
-    except BaseException as e:
-        print(f"小说《{title}》更新失败：{e}")
+    except BaseException:
         return "failed", chapter_id_now, finished

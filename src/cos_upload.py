@@ -3,6 +3,7 @@ from qcloud_cos import CosConfig
 # noinspection PyPackageRequirements
 from qcloud_cos import CosS3Client
 import os
+from loguru import logger
 
 
 def cos_upload(file_path, config):
@@ -28,6 +29,8 @@ def cos_upload(file_path, config):
     cos_base_dir = config["upload"]["base_dir"]
     # cos不需要使用os.path.join
     object_name = cos_base_dir + "/" + file_name
+
+    logger.debug(f"上传文件到 {object_name}")
 
     # 上传文件
     response = client.put_object_from_local_file(
