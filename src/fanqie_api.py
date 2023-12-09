@@ -126,6 +126,7 @@ def update(url: str, encoding: str, start_id: str, file_path: str, config: dict)
     finished: int = 0
 
     if os.path.exists(file_path) is False:
+        print(f"小说更新失败：本地文件不存在 路径：{file_path}")
         return "failed", chapter_id_now, finished
 
     try:
@@ -150,7 +151,8 @@ def update(url: str, encoding: str, start_id: str, file_path: str, config: dict)
 
         # 判断是否已经最新
         if start_index >= len(chapters):
-            return "completed", title, last_cid, finished
+            print(f"小说《{title}》已经是最新章节，无需更新")
+            return "completed", last_cid, finished
 
         with open(file_path, 'ab') as f:
             try:

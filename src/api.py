@@ -100,9 +100,9 @@ def block_method():
     if request.method == 'POST':
         ip = get_remote_address()
         # 检查IP是否在黑名单中
-        cur = db.cursor()
-        cur.execute("SELECT unblock_time FROM blacklist WHERE ip=?", (ip,))
-        row = cur.fetchone()
+        cur1 = db.cursor()
+        cur1.execute("SELECT unblock_time FROM blacklist WHERE ip=?", (ip,))
+        row = cur1.fetchone()
         if row is not None:
             # 检查限制是否已经解除
             unblock_time = datetime.strptime(row[0], '%Y-%m-%d %H:%M:%S.%f')
@@ -114,8 +114,9 @@ def block_method():
                 return response
             else:
                 # 如果限制已经解除，那么从黑名单中移除这个IP
-                cur.execute("DELETE FROM blacklist WHERE ip=?", (ip,))
+                cur1.execute("DELETE FROM blacklist WHERE ip=?", (ip,))
                 db.commit()
+        cur1.close()
 
 
 @app.errorhandler(429)
@@ -123,11 +124,12 @@ def ratelimit_handler(_e):
     # 将触发限制的IP添加到黑名单中，限制解除时间为1小时后
     ip = get_remote_address()
     unblock_time = datetime.now() + timedelta(hours=1)
-    cur = db.cursor()
-    cur.execute("INSERT OR REPLACE INTO blacklist VALUES (?, ?)", (ip, unblock_time.strftime('%Y-%m-%d %H:%M:%S.%f')))
+    cur0 = db.cursor()
+    cur0.execute("INSERT OR REPLACE INTO blacklist VALUES (?, ?)", (ip, unblock_time.strftime('%Y-%m-%d %H:%M:%S.%f')))
     db.commit()
     response = make_response("Too many requests. You have been added to the blacklist for 1 hour.", 429)
     response.headers['Retry-After'] = str(3600)  # 1小时的秒数
+    cur0.close()
     return response
 
 
@@ -152,27 +154,29 @@ class Spider:
         try:
             print(f"Crawling for URL: {url}")
             book_id = url_to_book_id(url)
-            cur = db.cursor()
-            cur.execute("SELECT finished FROM novels WHERE id=?", (book_id,))
-            row = cur.fetchone()
+            curm = db.cursor()
+            curm.execute("SELECT finished FROM novels WHERE id=?", (book_id,))
+            row = curm.fetchone()
             # 根据完结信息判断模式
             if row is not None and row[0] == 0:
                 # 如果已有信息，使用增量更新模式
                 with Pool(processes=1) as pool:
-                    cur.execute("SELECT name, last_cid FROM novels WHERE id=?", (book_id,))
-                    row = cur.fetchone()
+                    print("Incremental update mode.")
+                    curm.execute("SELECT name, last_cid FROM novels WHERE id=?", (book_id,))
+                    row = curm.fetchone()
                     title = row[0]
                     last_cid = row[1]
                     file_path = os.path.join(config["save_dir"],
                                              config["filename_format"].format(title=title, book_id=book_id))
+                    print(f"File path: {file_path}")
                     res = pool.apply(update, (url, config["encoding"], last_cid, file_path, config))  # 运行函数
                     # 获取任务和小说信息
                     status, last_cid, finished = res
                     # 写入数据库
-                    cur.execute("UPDATE novels SET last_cid=?, last_update=?, finished=? WHERE id=?",
-                                (last_cid, datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f'), finished,
-                                 book_id))
+                    curm.execute("UPDATE novels SET last_cid=?, last_update=?, finished=? WHERE id=?",
+                                 (last_cid, datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f'), finished, book_id))
                     db.commit()
+                    curm.close()
                     if status == "completed":
                         return "completed"
                     else:
@@ -180,21 +184,22 @@ class Spider:
             else:
                 # 如果没有或者未成功，则普通下载
                 with Pool(processes=1) as pool:
+                    print("Normal download mode.")
                     res = pool.apply(download, (url, config["encoding"], config))  # 运行函数
                     # 获取任务和小说信息
                     status, name, last_cid, finished = res
                     # 写入数据库
-                    cur.execute("UPDATE novels SET name=?, last_cid=?, last_update=?, finished=? WHERE id=?",
-                                (name, last_cid, datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f'), finished,
-                                 book_id))
+                    curm.execute("UPDATE novels SET name=?, last_cid=?, last_update=?, finished=? WHERE id=?",
+                                 (name, last_cid, datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f'), finished, book_id))
                     db.commit()
+                    curm.close()
                     if status == "completed":
-                        return True
+                        return "True"
                     else:
-                        return False
+                        return "False"
         except Exception as e:
             print(f"Error: {e}")
-            return False
+            return "False"
 
     def worker(self):
         # 当运行状态为True时，持续工作
@@ -203,23 +208,24 @@ class Spider:
                 # 从URL队列中获取URL
                 url = self.url_queue.get(timeout=1)
                 book_id = url_to_book_id(url)
-                cur = db.cursor()
-                cur.execute("INSERT OR REPLACE INTO novels (id, status) VALUES (?, ?)", (book_id, "进行中"))
+                curn = db.cursor()
+                curn.execute("UPDATE novels SET status=? WHERE id=?", ("进行中", book_id))
                 db.commit()
                 status = Spider.crawl(url)
                 # 调用爬虫函数爬取URL，如果出错则标记为失败并跳过这个任务进行下一个
-                if status:
-                    cur.execute("UPDATE novels SET status=? WHERE id=?", ("已完成", book_id))
+                if status == "True":
+                    curn.execute("UPDATE novels SET status=? WHERE id=?", ("已完成", book_id))
                     db.commit()
                 elif status == "completed":
-                    cur.execute("UPDATE novels SET status=? WHERE id=?", ("已更新完成", book_id))
+                    curn.execute("UPDATE novels SET status=? WHERE id=?", ("已更新完成", book_id))
                     db.commit()
                 elif status == "failed":
-                    cur.execute("UPDATE novels SET status=? WHERE id=?", ("更新失败", book_id))
+                    curn.execute("UPDATE novels SET status=? WHERE id=?", ("更新失败", book_id))
                     db.commit()
                 else:
-                    cur.execute("UPDATE novels SET status=? WHERE id=?", ("失败", book_id))
+                    curn.execute("UPDATE novels SET status=? WHERE id=?", ("失败", book_id))
                     db.commit()
+                curn.close()
                 # 完成任务后，标记任务为完成状态
                 self.url_queue.task_done()
             except queue.Empty:
@@ -232,25 +238,28 @@ class Spider:
 
     def add_url(self, book_id):
         # 则将URL添加到队列中并返回成功信息
-        cur = db.cursor()
-        cur.execute("SELECT status, finished FROM novels WHERE id=?", (book_id,))
-        row = cur.fetchone()
+        cura = db.cursor()
+        cura.execute("SELECT status, finished FROM novels WHERE id=?", (book_id,))
+        row = cura.fetchone()
         if row is None or row[0] == "失败":
             self.url_queue.put(book_id_to_url(book_id))
-            cur.execute("INSERT OR REPLACE INTO novels (id, status) VALUES (?, ?)", (book_id, "等待中"))
+            cura.execute("INSERT OR REPLACE INTO novels (id, status) VALUES (?, ?)", (book_id, "等待中"))
             db.commit()
+            cura.close()
             return "此书籍已添加到下载队列"
         else:
             # 如果已存在，检查书籍是否已完结
             if row[1] == 1:
+                cura.close()
                 # 如果已完结，返回提示信息
                 return "此书籍已存在且已完结，请直接前往下载"
             elif row[0] == "等待中" or row[0] == "进行中" or row[0] == "等待更新中":
+                cura.close()
                 # 如果正在下载，返回提示信息
                 return "此书籍已存在且正在下载（如果你需要查询，请在“类型”中选择“查询”而不是“添加”）"
             else:
-                cur.execute("SELECT last_update FROM novels WHERE id=?", (book_id,))
-                row = cur.fetchone()
+                cura.execute("SELECT last_update FROM novels WHERE id=?", (book_id,))
+                row = cura.fetchone()
                 last_update = datetime.strptime(row[0], '%Y-%m-%d %H:%M:%S.%f')
 
                 # 如果上次时间距现在小于3小时，返回提示
@@ -259,8 +268,9 @@ class Spider:
 
                 # 如果未完结，返回提示信息并尝试更新
                 self.url_queue.put(book_id_to_url(book_id))
-                cur.execute("UPDATE novels SET status=? WHERE id=?", ("等待更新中", book_id))
+                cura.execute("UPDATE novels SET status=? WHERE id=?", ("等待更新中", book_id))
                 db.commit()
+                cura.close()
                 return "此书籍已存在，正在尝试更新"
 
     def stop(self):
@@ -315,9 +325,10 @@ def api():
         message = spider.add_url(book_id)
         url = book_id_to_url(book_id)
         position = list(spider.url_queue.queue).index(url) + 1 if url in list(spider.url_queue.queue) else None
-        cur = db.cursor()
-        cur.execute("SELECT status, last_update FROM novels WHERE id=?", (book_id,))
-        row = cur.fetchone()
+        curq = db.cursor()
+        curq.execute("SELECT status, last_update FROM novels WHERE id=?", (book_id,))
+        row = curq.fetchone()
+        curq.close()
         status = row[0] if row is not None else None
         if row is not None:
             last_update = row[1].split('.')[0] if row[1] is not None else None
@@ -332,9 +343,10 @@ def api():
         book_id = data['id']
         url = book_id_to_url(book_id)
         position = list(spider.url_queue.queue).index(url) + 1 if url in list(spider.url_queue.queue) else None
-        cur = db.cursor()
-        cur.execute("SELECT status, last_update FROM novels WHERE id=?", (book_id,))
-        row = cur.fetchone()
+        curw = db.cursor()
+        curw.execute("SELECT status, last_update FROM novels WHERE id=?", (book_id,))
+        row = curw.fetchone()
+        curw.close()
         status = row[0] if row is not None else None
         if row is not None:
             last_update = row[1].split('.')[0] if row[1] is not None else None
@@ -425,24 +437,26 @@ def manage(group, action):
             return "Bad Request.", 400
 
     elif group == "tasks":
+        curt = db.cursor()
         if action == "list-new-tasks":
             tasks_dict = {}
-            cur = db.cursor()
-            cur.execute("SELECT id, status FROM novels ORDER BY ROWID DESC LIMIT 30", ())
-            for i, row in enumerate(cur.fetchall()):
+            curt.execute("SELECT id, status FROM novels ORDER BY ROWID DESC LIMIT 30", ())
+            for i, row in enumerate(curt.fetchall()):
                 tasks_dict[f'task{i}'] = {'id': row[0], 'status': row[1]}
+            curt.close()
             return jsonify(tasks_dict)
         elif action == "list-all-tasks":
             if config["administrator"]["enable-list-all-tasks"] is False:
                 return "此功能已被禁用", 403
             tasks_dict = {}
-            cur = db.cursor()
-            cur.execute("SELECT id, status FROM novels")
-            for i, row in enumerate(cur.fetchall()):
+            curt.execute("SELECT id, status FROM novels")
+            for i, row in enumerate(curt.fetchall()):
                 tasks_dict[f'task{i}'] = {'id': row[0], 'status': row[1]}
+            curt.close()
             return jsonify(tasks_dict)
         elif action == "list-tasks-all":
             # 已废弃的动作
+            curt.close()
             return "请直接使用数据库管理工具查看", 410
         elif action == "clear-tasks":
             while not spider.url_queue.empty():
@@ -450,46 +464,54 @@ def manage(group, action):
                     spider.url_queue.get_nowait()
                 except queue.Empty:
                     break
+            curt.close()
             return "已清空"
         else:
+            curt.close()
             return "Bad Request.", 400
 
     elif group == "blacklist":
+        curb = db.cursor()
         if action == "list-blacklist":
-            cur = db.cursor()
-            cur.execute("SELECT * FROM blacklist")
-            rows = cur.fetchall()
+            curb.execute("SELECT * FROM blacklist")
+            rows = curb.fetchall()
+            curb.close()
             return jsonify(rows)
         elif action == "add-blacklist":
             ip = request.args["ip"]
-            cur = db.cursor()
             if "time" not in request.args:
                 unblock_time = datetime.now() + timedelta(hours=1)
-                cur.execute("INSERT OR REPLACE INTO blacklist VALUES (?, ?)",
-                            (ip, unblock_time.strftime('%Y-%m-%d %H:%M:%S.%f')))
+                curb.execute("INSERT OR REPLACE INTO blacklist VALUES (?, ?)",
+                             (ip, unblock_time.strftime('%Y-%m-%d %H:%M:%S.%f')))
                 db.commit()
+                curb.close()
                 return "已添加，解除时间为1小时后"
             else:
                 try:
                     unblock_time = datetime.now() + timedelta(hours=int(request.args["time"]))
-                    cur.execute("INSERT OR REPLACE INTO blacklist VALUES (?, ?)",
-                                (ip, unblock_time.strftime('%Y-%m-%d %H:%M:%S.%f')))
+                    curb.execute("INSERT OR REPLACE INTO blacklist VALUES (?, ?)",
+                                 (ip, unblock_time.strftime('%Y-%m-%d %H:%M:%S.%f')))
                     db.commit()
+                    curb.close()
                     return f"已添加，解除时间为{request.args['time']}小时后"
                 except ValueError:
+                    curb.close()
                     return "时间格式不正确"
         elif action == "remove-blacklist":
             ip = request.args["ip"]
-            cur = db.cursor()
-            cur.execute("DELETE FROM blacklist WHERE ip=?", (ip,))
+            curb.execute("DELETE FROM blacklist WHERE ip=?", (ip,))
             db.commit()
+            curb.close()
             return f"已移除 {ip}"
         elif action == "clear-blacklist":
-            cur = db.cursor()
             # noinspection SqlWithoutWhere
-            cur.execute("DELETE FROM blacklist")
+            curb.execute("DELETE FROM blacklist")
             db.commit()
+            curb.close()
             return "已清空黑名单"
+        else:
+            curb.close()
+            return "Bad Request.", 400
 
     else:
         return "Bad Request.", 400
