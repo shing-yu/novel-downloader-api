@@ -124,7 +124,7 @@ while True:
                 input("按回车键继续...")
             elif input_num == "4":
                 print("正在更新配置文件...")
-                response = requests.post(api_url.format(group=group, action="update"), params=get_params())
+                response = requests.post(api_url.format(group=group, action="update-config"), params=get_params())
                 print(response.text)
                 input("按回车键继续...")
             elif input_num == "5":

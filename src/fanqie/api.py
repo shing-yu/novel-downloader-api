@@ -29,8 +29,7 @@ import queue
 import threading
 from multiprocessing import Pool
 import time
-# import fanqie_api as fa
-from src.fanqie.fanqie_api import download, update
+from fanqie_api import download, update
 from flask import Flask, request, jsonify, make_response, send_from_directory
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -67,29 +66,42 @@ if config["administrator"]["totp"]["enable"]:
 
 # 配置控制台和文件使用不同级别输出
 logger.remove()
+log_format = "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <level>{message}</level>"
 logger.add(config["log"]["filepath"], rotation=config["log"]["maxSize"], level=config["log"]["level"],
-           retention=config["log"]["backupCount"], encoding="utf-8", enqueue=True)
-logger.add(sys.stdout, level=config["log"]["console_level"], enqueue=True)
+           retention=config["log"]["backupCount"], encoding="utf-8", enqueue=True, format=log_format)
+logger.add(sys.stdout, level=config["log"]["console_level"], enqueue=True, format=log_format)
 
 app = Flask(__name__)
 # 使用loguru的日志记录器替换flask的日志记录器
 
+if config["cdn"] is False:
+    class InterceptHandler(logging.Handler):
+        def emit(self, record):
+            excluded_module = 'qcloud_cos.cos_client:put_object'
+            if excluded_module not in record.name:
+                # Retrieve context where the logging call occurred, this happens to be in the 6th frame upward
+                logger_opt = logger.opt(depth=6, exception=record.exc_info)
+                logger_opt.log(record.levelno, record.getMessage())
 
-class InterceptHandler(logging.Handler):
-    def emit(self, record):
-        # Retrieve context where the logging call occurred, this happens to be in the 6th frame upward
-        logger_opt = logger.opt(depth=6, exception=record.exc_info)
-        logger_opt.log(record.levelno, record.getMessage())
+
+    app.logger.addHandler(InterceptHandler())
+    logging.basicConfig(handlers=[InterceptHandler()], level=20)
 
 
-app.logger.addHandler(InterceptHandler())
-logging.basicConfig(handlers=[InterceptHandler()], level=20)
+def get_ip():
+    if config['cdn']:
+        x_forwarded_for = request.headers.get('X-Forwarded-For')
+        client_ip = x_forwarded_for.split(',')[0].strip()
+        return client_ip
+    else:
+        return get_remote_address()
+
 
 if config["reserve_proxy"] is False:
     from flask_cors import CORS
     CORS(app)
 limiter = Limiter(
-    key_func=get_remote_address,
+    key_func=get_ip,
     app=app,
     default_limits=["360 per day", "180 per hour"]
 )
@@ -124,9 +136,9 @@ logger.success("程序已启动")
 
 @app.before_request
 def block_method():
+    logger.info(f"请求：{get_ip()} - {request.method} - {request.path}")
     if request.method == 'POST':
-        ip = get_remote_address()
-        logger.info(f"请求IP：{ip} 尝试访问POST接口")
+        ip = get_ip()
         # 检查IP是否在黑名单中
         cur1 = db.cursor()
         cur1.execute("SELECT unblock_time FROM blacklist WHERE ip=?", (ip,))
@@ -150,7 +162,7 @@ def block_method():
 @app.errorhandler(429)
 def ratelimit_handler(_e):
     # 将触发限制的IP添加到黑名单中，限制解除时间为1小时后
-    ip = get_remote_address()
+    ip = get_ip()
     logger.warning(f"IP: {ip} 触发了限制，已被添加到黑名单")
     unblock_time = datetime.now() + timedelta(hours=1)
     cur0 = db.cursor()
@@ -272,6 +284,20 @@ class Spider:
 
     def start(self):
         logger.info("爬虫工作启动")
+        # 启动时检查数据库中是否有未完成的任务
+        curc = db.cursor()
+        curc.execute("SELECT id FROM novels WHERE status IN (?, ?, ?) ORDER BY ROWID",
+                     ("进行中", "等待中", "等待更新中"))
+        rows = curc.fetchall()
+        curc.close()
+        if len(rows) == 0:
+            logger.success("数据库中没有未完成的任务")
+        if len(rows) > 0:
+            logger.warning(f"数据库中有{len(rows)}个未完成的任务")
+        # 有则添加到队列
+        for row in rows:
+            self.url_queue.put(book_id_to_url(row[0]))
+            logger.debug(f"ID: {row[0]} 已添加到队列")
         # 启动工作线程
         threading.Thread(target=self.worker, daemon=True).start()
 

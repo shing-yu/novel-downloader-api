@@ -178,7 +178,7 @@ def update(url: str, encoding: str, start_id: str, file_path: str, config: dict)
                     # 将数据追加到文件中
                     f.write(data)
 
-                    logger.debug(f"小说: {title} 已增加 {chapter_title} 章节ID: {chapter_id_now}")
+                    logger.trace(f"小说: {title} 已增加 {chapter_title} 章节ID: {chapter_id_now}")
 
                 logger.success(f"小说《{title}》已保存到本地，路径：{file_path}")
 
